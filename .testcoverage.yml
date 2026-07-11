@@ -1,0 +1,27 @@
+# Configuration for github.com/vladopajic/go-test-coverage
+# https://github.com/vladopajic/go-test-coverage
+
+# (mandatory)
+# Path to the coverage profile file (output of `go test -coverprofile`).
+profile: coverage.txt
+
+# (optional; but recommended to set)
+# Strips this local prefix from reported file paths in the output.
+local-prefix: "github.com/slashdevops/c3e"
+
+# Coverage thresholds (percentages, [0-100]). Kept a comfortable margin below
+# the current measured coverage (~85%) so ordinary changes do not trip CI.
+threshold:
+  # Minimum coverage percentage required for individual files.
+  file: 0
+
+  # Minimum coverage percentage required for each package.
+  package: 70
+
+  # Minimum overall project coverage percentage required.
+  total: 75
+
+# Regexp rules to exclude matched files or packages from coverage statistics.
+exclude:
+  paths:
+    - ^examples/ # runnable example programs
