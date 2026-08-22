@@ -121,8 +121,18 @@
 //   - Dependency links only cover items already present in a cached value, so
 //     adding a new item to a cached collection is invisible to the graph —
 //     invalidate the collection's own key when its membership changes.
-//   - The dependency-tracking keys expire with the entry TTL (refreshed on each
-//     write), so they cannot leak when an entry expires naturally.
+//   - The dependency-tracking keys carry a TTL so they cannot leak when an entry
+//     expires naturally instead of being invalidated. A reverse-dependency set
+//     is shared, so its expiry may only ever be raised, never lowered: it is set
+//     with EXPIRE NX when the set has none and raised with EXPIRE GT when a
+//     longer-lived dependent joins. A set that could be shortened by the most
+//     recent writer would expire before entries still listed in it, and an
+//     Invalidate landing in that window would cascade to nothing and report
+//     success. Both commands are needed — GT treats a key with no expiry as
+//     infinite and would refuse to set one at all.
+//   - The cascade is breadth-first and batched one level at a time, so its cost
+//     is proportional to the depth of the dependency graph rather than to the
+//     number of nodes in it.
 //
 // # Stale-while-revalidate
 //
@@ -134,7 +144,11 @@
 //     goroutine refreshes the entry. The refresh runs on a
 //     [context.WithoutCancel] copy of the caller's context (bounded by its own
 //     timeout) so it survives the caller returning.
-//   - miss  — age > HardTTL or the entry is absent. The caller blocks while
+//   - miss  — age > HardTTL, the entry is absent, or what was stored no longer
+//     decodes (a changed EncoderType, or a cached type whose shape moved during
+//     a rolling deploy). A stored value that cannot be read is treated as
+//     absent and refetched, because returning the decode error instead would
+//     fail every read of that key until its hard TTL expired. The caller blocks while
 //     the fetcher runs (under singleflight).
 //   - timeout / error — the cache did not answer within QueryTimeout, or
 //     returned an error; the caller falls back to the fetcher immediately.

@@ -118,10 +118,29 @@ func (m *CacheManager) Set(ctx context.Context, identifier CacheIdentifier, data
 		}
 	}
 
-	// Add new dependencies (reverse-dep sets), each bounded by the entry TTL
+	// Add new dependencies (reverse-dep sets), each bounded by the entry TTL.
+	//
+	// A reverse-dependency set is SHARED by every entry that depends on the same
+	// thing, so an unconditional EXPIRE here lets the last writer shorten it —
+	// including below the TTL of an entry already in the set. Jittered TTLs make
+	// that routine rather than rare: with 10% jitter on a 12h hard TTL, entries
+	// land anywhere in 10.8h–13.2h, so dep:role:R can expire up to 2.4h before an
+	// authorization entry that depends on it. In that window Invalidate finds an
+	// empty set, cascades to nothing, and reports success — a revoked role keeps
+	// working until the dependent entry expires on its own.
+	//
+	// Two commands give the set the TTL of its longest-lived member and never
+	// less. NX sets an expiry only when the key has none, which covers the first
+	// dependent and any set whose TTL has since lapsed. GT then raises it only
+	// when this entry outlives what is already there. Neither can shorten it.
+	//
+	// NX is not redundant: GT treats a key with no TTL as having an infinite one
+	// and refuses to set it, so GT alone would leave the set persistent forever —
+	// exactly the leak the TTL exists to prevent.
 	for _, newKey := range newDepKeys {
 		cmds = append(cmds, builder.Sadd().Key(newKey).Member(cKey).Build())
-		cmds = append(cmds, builder.Expire().Key(newKey).Seconds(ttlSecs).Build())
+		cmds = append(cmds, builder.Expire().Key(newKey).Seconds(ttlSecs).Nx().Build())
+		cmds = append(cmds, builder.Expire().Key(newKey).Seconds(ttlSecs).Gt().Build())
 	}
 
 	// Set the cached data with TTL
@@ -193,7 +212,7 @@ func (m *CacheManager) Get(ctx context.Context, identifier CacheIdentifier, ttl 
 func (m *CacheManager) Invalidate(ctx context.Context, identifier CacheIdentifier) error {
 	// Use a queue for breadth-first invalidation (safer than recursion)
 	itemKey := cacheKey(identifier)
-	queue := []string{depKey(identifier)}
+	level := []string{depKey(identifier)}
 	visited := make(map[string]bool)
 	builder := m.client.B()
 
@@ -221,64 +240,123 @@ func (m *CacheManager) Invalidate(ctx context.Context, identifier CacheIdentifie
 	delCommands = append(delCommands, builder.Del().Key(itemKey).Build())
 
 	// --- Step 2: Cascade invalidation to all dependents (downstream) ---
-	for len(queue) > 0 {
-		// Pop from queue
-		currentDepKey := queue[0]
-		queue = queue[1:]
+	//
+	// Breadth-first, one level at a time, with a single round trip per lookup
+	// kind per level. This used to issue one SMEMBERS per node *plus* one per
+	// dependent, all sequentially, so a wide dependency graph turned into
+	// hundreds of serial round trips on the write path — against a server the
+	// read path deliberately fast-fails on. Batching makes the cost O(depth)
+	// round trips instead of O(nodes).
+	//
+	// Deleted dep sets are tracked so a dependent's forward list does not SREM
+	// against a set already queued for deletion, which is what the per-node
+	// version used the currentDepKey comparison for.
+	deletedDepKeys := make(map[string]bool)
 
-		if visited[currentDepKey] {
+	for len(level) > 0 {
+		// Drop anything already handled, and claim the rest for this level.
+		pending := level[:0:0]
+
+		for _, depK := range level {
+			if visited[depK] {
+				continue
+			}
+
+			visited[depK] = true
+
+			pending = append(pending, depK)
+		}
+
+		if len(pending) == 0 {
+			break
+		}
+
+		// One round trip: every reverse-dependency set in this level.
+		memberCmds := make([]valkey.Completed, 0, len(pending))
+		for _, depK := range pending {
+			memberCmds = append(memberCmds, builder.Smembers().Key(depK).Build())
+		}
+
+		dependentsOf := make(map[string][]string, len(pending))
+
+		for i, res := range m.client.DoMulti(ctx, memberCmds...) {
+			dependents, err := res.AsStrSlice()
+			if err != nil && !valkey.IsValkeyNil(err) {
+				return fmt.Errorf("%w for key %s: %w", ErrGetDependents, pending[i], err)
+			}
+
+			if valkey.IsValkeyNil(err) {
+				dependents = nil
+			}
+
+			dependentsOf[pending[i]] = dependents
+		}
+
+		// The dep sets themselves go away regardless of what they contained.
+		for _, depK := range pending {
+			delCommands = append(delCommands, builder.Del().Key(depK).Build())
+			deletedDepKeys[depK] = true
+		}
+
+		// Collect this level's dependents, de-duplicated: two dep sets in the
+		// same level can name the same cache entry.
+		seen := make(map[string]bool)
+		cKeys := make([]string, 0)
+
+		for _, depK := range pending {
+			for _, cKey := range dependentsOf[depK] {
+				if seen[cKey] {
+					continue
+				}
+
+				seen[cKey] = true
+
+				cKeys = append(cKeys, cKey)
+			}
+		}
+
+		if len(cKeys) == 0 {
+			level = nil
 			continue
 		}
 
-		visited[currentDepKey] = true
+		m.logger.Debug("cache: invalidation level",
+			"dep_keys", len(pending), "dependents_found", len(cKeys))
 
-		// Find all cache keys that depend on this entity (reverse dependencies)
-		smembersCmd := builder.Smembers().Key(currentDepKey).Build()
-		result := m.client.Do(ctx, smembersCmd)
-		dependents, err := result.AsStrSlice()
-		m.logger.Debug("cache: invalidation step", "current_dep_key", currentDepKey, "dependents_found", len(dependents))
-
-		if err != nil && !valkey.IsValkeyNil(err) {
-			return fmt.Errorf("%w for key %s: %w", ErrGetDependents, currentDepKey, err)
+		// Second round trip: every dependent's forward-dependency list.
+		fwdCmds := make([]valkey.Completed, 0, len(cKeys))
+		for _, cKey := range cKeys {
+			fwdCmds = append(fwdCmds, builder.Smembers().Key(depsForKey(cKey)).Build())
 		}
 
-		// If key doesn't exist, treat as empty list
-		if valkey.IsValkeyNil(err) {
-			dependents = []string{}
-		}
+		fwdResults := m.client.DoMulti(ctx, fwdCmds...)
 
-		// Delete the reverse-dependency set
-		delCommands = append(delCommands, builder.Del().Key(currentDepKey).Build())
+		next := make([]string, 0, len(cKeys))
 
-		// Process each dependent cache entry
-		for _, cKey := range dependents {
-			// --- Clean up this dependent's forward dependencies ---
-			// Remove this dependent from the reverse-dependency sets of items it depends on
-			cKeyDepsKey := depsForKey(cKey)
-			cKeyDepsResult := m.client.Do(ctx, builder.Smembers().Key(cKeyDepsKey).Build())
-			if cKeyDeps, err := cKeyDepsResult.AsStrSlice(); err == nil {
-				for _, dep := range cKeyDeps {
-					// Remove from the reverse dependency set
-					// Skip if it's the set we're currently processing (already being deleted)
-					if dep != currentDepKey {
+		for i, cKey := range cKeys {
+			// Unlink this dependent from the reverse sets it belongs to, so a
+			// surviving set does not keep pointing at a deleted entry. Sets
+			// already queued for deletion need no SREM.
+			if fwdDeps, err := fwdResults[i].AsStrSlice(); err == nil {
+				for _, dep := range fwdDeps {
+					if !deletedDepKeys[dep] {
 						delCommands = append(delCommands, builder.Srem().Key(dep).Member(cKey).Build())
 					}
 				}
 			}
 
-			// Delete the dependent's cache data
-			delCommands = append(delCommands, builder.Del().Key(cKey).Build())
+			delCommands = append(delCommands,
+				builder.Del().Key(cKey).Build(),
+				builder.Del().Key(depsForKey(cKey)).Build(),
+			)
 
-			// Delete the dependent's forward-dependency list
-			delCommands = append(delCommands, builder.Del().Key(cKeyDepsKey).Build())
-
-			// Queue the dependent's reverse-dependency key for cascade invalidation
-			// This allows us to find and invalidate anything that depends on this dependent
-			nextDepKey := depKeyFromCacheKey(cKey)
-			if !visited[nextDepKey] {
-				queue = append(queue, nextDepKey)
+			// Anything depending on this dependent belongs to the next level.
+			if nextDepKey := depKeyFromCacheKey(cKey); !visited[nextDepKey] {
+				next = append(next, nextDepKey)
 			}
 		}
+
+		level = next
 	}
 
 	// Execute all deletions in a batch
