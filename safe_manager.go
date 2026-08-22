@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -185,7 +186,25 @@ func (m *SafeCacheManager) Get(ctx context.Context, identifier CacheIdentifier, 
 
 		// --- CASE A (Fresh) or B (Stale) ---
 		// In both cases, we serve the data we have *right now*.
-		return m.unmarshalData(item.Data, dest)
+		//
+		// Unless it no longer decodes. A corrupt *wrapper* is already treated as
+		// a miss above; a payload inside a valid wrapper used to be a hard error
+		// returned to the caller, which is the worse half of the same problem.
+		// It happens whenever the stored bytes stop matching the decoder:
+		// EncoderType changed on a warm cache, or a cached struct changed shape
+		// during a rolling deploy where two binary versions share one server.
+		// Returning the error makes every read of that key fail for the whole
+		// hard TTL; treating it as a miss costs one fetch and heals the entry.
+		if err := m.unmarshalData(item.Data, dest); err != nil {
+			m.log().Warn("cache: failed to decode cached payload, refetching",
+				"key", cKey, "error", err)
+
+			result = ResultMiss
+
+			return m.blockingFetch(ctx, identifier, dest, fetcher)
+		}
+
+		return nil
 	}
 
 	// 4. Handle TIMEOUT
@@ -237,14 +256,54 @@ func (m *SafeCacheManager) blockingFetch(ctx context.Context, identifier CacheId
 		return err
 	}
 
-	// `res` is the `wrapperData` ([]byte) from fetchAndCache
+	fetched, ok := res.(*fetchResult)
+	if !ok || fetched == nil {
+		return fmt.Errorf("cache: unexpected fetch result %T", res)
+	}
+
+	// The value could not be serialized, so there is nothing to decode. Copy it
+	// into dest directly rather than failing a request the source of truth
+	// already answered.
+	if fetched.wrapper == nil {
+		return assignFetched(dest, fetched.raw)
+	}
+
 	var item CachedItem
-	if err := json.Unmarshal(res.([]byte), &item); err != nil {
+	if err := json.Unmarshal(fetched.wrapper, &item); err != nil {
 		return fmt.Errorf("cache: failed to unmarshal fetched wrapper: %w", err)
 	}
 
 	// Unmarshal the inner data into the user's destination
 	return m.unmarshalData(item.Data, dest)
+}
+
+// assignFetched writes src into the pointer dest, the fallback used when a
+// value could not be serialized and so cannot be decoded into place.
+//
+// It is deliberately strict: a mismatch means the fetcher returned something
+// other than what the caller asked for, which is a programming error worth
+// surfacing rather than papering over with a zero value.
+func assignFetched(dest, src any) error {
+	rv := reflect.ValueOf(dest)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return fmt.Errorf("cache: destination must be a non-nil pointer, got %T", dest)
+	}
+
+	elem := rv.Elem()
+
+	if src == nil {
+		elem.SetZero()
+		return nil
+	}
+
+	sv := reflect.ValueOf(src)
+	if !sv.Type().AssignableTo(elem.Type()) {
+		return fmt.Errorf("cache: fetched %T is not assignable to %s", src, elem.Type())
+	}
+
+	elem.Set(sv)
+
+	return nil
 }
 
 // unmarshalData decodes the data using the configured encoder type.
@@ -267,7 +326,17 @@ func (m *SafeCacheManager) unmarshalData(data []byte, dest any) error {
 
 // fetchAndCache is the single-flight function that does the work.
 // It returns the serialized wrapper (`[]byte`) to the singleflight group.
-func (m *SafeCacheManager) fetchAndCache(ctx context.Context, identifier CacheIdentifier, fetcher FetcherFunc) (any, error) {
+// fetchResult is what fetchAndCache hands back to singleflight.
+//
+// wrapper is the serialized CachedItem, present whenever serialization
+// succeeded. raw is always the value the fetcher returned. When wrapper is nil
+// the value could not be cached, and raw is what the caller must serve.
+type fetchResult struct {
+	raw     any
+	wrapper []byte
+}
+
+func (m *SafeCacheManager) fetchAndCache(ctx context.Context, identifier CacheIdentifier, fetcher FetcherFunc) (*fetchResult, error) {
 	// 1. Get data and dependencies from the primary source
 	data, deps, err := fetcher(ctx)
 	if err != nil {
@@ -284,16 +353,23 @@ func (m *SafeCacheManager) fetchAndCache(ctx context.Context, identifier CacheId
 	switch encoderType {
 	case CacheEncoderTypeGob:
 		serializedData, err = EncodeGob(data)
-		if err != nil {
-			return nil, fmt.Errorf("failed to encode data with gob: %w", err)
-		}
 	case CacheEncoderTypeJSON:
 		fallthrough
 	default:
 		serializedData, err = json.Marshal(data)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal data: %w", err)
-		}
+	}
+
+	// A value that cannot be serialized is a caching problem, not a request
+	// problem: the source of truth already answered. Failing here made a
+	// serialization fault user-visible even though the expensive work had
+	// succeeded — and because Set below already logs and swallows its own
+	// failure, the two halves of one write behaved differently. Hand the value
+	// back uncached and let the caller proceed.
+	if err != nil {
+		m.log().Warn("cache: failed to encode value, returning it uncached",
+			"key", cacheKey(identifier), "encoder", encoderType, "error", err)
+
+		return &fetchResult{raw: data}, nil
 	}
 
 	// 3. Create the cache wrapper
@@ -305,7 +381,10 @@ func (m *SafeCacheManager) fetchAndCache(ctx context.Context, identifier CacheId
 	// 4. Serialize the wrapper
 	wrapperData, err := json.Marshal(item)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal wrapper: %w", err)
+		m.log().Warn("cache: failed to marshal wrapper, returning value uncached",
+			"key", cacheKey(identifier), "error", err)
+
+		return &fetchResult{raw: data}, nil
 	}
 
 	// 5. Apply jitter to hard TTL
@@ -320,5 +399,5 @@ func (m *SafeCacheManager) fetchAndCache(ctx context.Context, identifier CacheId
 	}
 
 	// 7. Return the serialized wrapper to singleflight (for blocking waiters)
-	return wrapperData, nil
+	return &fetchResult{wrapper: wrapperData, raw: data}, nil
 }
