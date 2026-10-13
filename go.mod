@@ -1,6 +1,6 @@
 module github.com/slashdevops/c3e
 
-go 1.26.0
+go 1.27.2
 
 require (
 	github.com/valkey-io/valkey-go v1.0.78

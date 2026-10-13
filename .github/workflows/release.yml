@@ -69,7 +69,7 @@ jobs:
         run: |
           echo "## Test Coverage" >> $GITHUB_STEP_SUMMARY
 
-          go install github.com/vladopajic/go-test-coverage/v2@v2.19.0
+          go install github.com/vladopajic/go-test-coverage/v2@v2.20.0
 
           # execute again to get the summary
           echo "" >> $GITHUB_STEP_SUMMARY
