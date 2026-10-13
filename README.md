@@ -1,7 +1,7 @@
 # 🚀 c3e — Cache with Cascading Expiration Engine
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/slashdevops/c3e.svg)](https://pkg.go.dev/github.com/slashdevops/c3e)
-[![Go Version](https://img.shields.io/badge/Go-1.26%2B-00ADD8?style=flat&logo=go)](https://golang.org/)
+[![Go Version](https://img.shields.io/badge/Go-1.27%2B-00ADD8?style=flat&logo=go)](https://golang.org/)
 [![Valkey](https://img.shields.io/badge/Valkey-Compatible-red?style=flat)](https://valkey.io/)
 [![CodeQL Advanced](https://github.com/slashdevops/c3e/actions/workflows/codeql.yml/badge.svg)](https://github.com/slashdevops/c3e/actions/workflows/codeql.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -31,7 +31,7 @@ TTL jitter, and type-safe operations on top of a plain cache.
 go get github.com/slashdevops/c3e
 ```
 
-**Requirements:** Go 1.26+ · [valkey-go](https://github.com/valkey-io/valkey-go)
+**Requirements:** Go 1.27+ · [valkey-go](https://github.com/valkey-io/valkey-go)
 v1.0.76+.
 
 ## 🚀 Quick start
